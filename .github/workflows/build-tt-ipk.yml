@@ -117,28 +117,27 @@ jobs:
           cat feeds.conf.default >> feeds.tmp
           mv feeds.tmp feeds.conf.default
 
-          # Only the feeds this package actually needs. "-a" additionally clones
-          # routing, telephony and friends, which cost minutes and can fail for
-          # reasons that have nothing to do with this build.
-          ./scripts/feeds update packages luci passwall_packages passwall2
+          # update/install everything, as upstream does. Narrowing the install to
+          # the feeds that look relevant does not work: luci-base pulls lua and
+          # lucihttp from the packages feed, and a selective install leaves the
+          # build without a host Lua interpreter and without lua.h.
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
           # geoview is a hard DEPENDS of luci-app-passwall2, so it is inside the
           # compile closure even though the proxy cores (kconfig selects) are
           # not. Its go.mod asks for a newer Go than the 24.10 golang feed ships,
           # and golang-package.mk sets GOTOOLCHAIN=local, so the toolchain cannot
-          # be fetched at build time — the build fails on the dependency, not on
-          # anything of ours. Upstream replaces the whole feed for this reason;
-          # only the golang half is needed here, since nothing in the closure is
-          # written in Rust.
+          # be fetched at build time. Upstream replaces the whole feed for this
+          # reason; only the golang half is needed here, since nothing in the
+          # closure is written in Rust.
           git clone --depth 1 -b master https://github.com/openwrt/packages.git /tmp/pkgfeed
           rm -rf feeds/packages/lang/golang
           cp -r /tmp/pkgfeed/lang/golang feeds/packages/lang/
           rm -rf /tmp/pkgfeed
-          ./scripts/feeds update -i
 
-          ./scripts/feeds install -a -p passwall_packages
-          ./scripts/feeds install -a -p passwall2
-          ./scripts/feeds install luci-base
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
       - name: Mark this build as a fork build
         run: |
