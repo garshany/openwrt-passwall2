@@ -1,0 +1,275 @@
+#
+# Fork-only workflow. Builds luci-app-passwall2 (and its i18n packages) from a
+# chosen ref of THIS fork and publishes the ipk to a release in THIS fork.
+#
+# It exists so the TrustTunnel node type can be installed with opkg instead of
+# copied onto the router by hand. Nothing here is meant for upstream.
+#
+# This file must live on the fork's DEFAULT branch: GitHub only offers the
+# workflow_dispatch trigger for workflows present there. The branch to build is
+# therefore an input rather than the ref the workflow runs on, which also means
+# the build source is pinned to one commit instead of following a moving branch.
+#
+# Adapted from the upstream "Auto compile with openwrt sdk" workflow, reduced to
+# the single job that builds the LuCI application. The multi-architecture matrix
+# in the original builds the binary cores (xray, sing-box, ...), which this fork
+# does not modify and takes from the upstream feed as before. The patch block in
+# the original (replacing the golang and rust feeds, patching patch-kernel.sh)
+# exists for those cores and is deliberately dropped here.
+#
+# Written for the 24.10 release SDK. The version suffix and the packager
+# selection below both assume it.
+#
+name: "Build TrustTunnel ipk"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or commit of this fork to build'
+        required: true
+        default: 'release/tt'
+      tag:
+        description: 'Release tag to create. Must not already exist, and must contain the PKG_VERSION being built.'
+        required: true
+        default: 'v26.7.16-tt1'
+      pkg_release_suffix:
+        description: 'Appended to PKG_RELEASE so opkg prefers this build over the upstream package'
+        required: true
+        default: '.tt1'
+      sdk_url:
+        description: 'OpenWrt SDK to build with (24.10 release SDKs only)'
+        required: true
+        default: 'https://downloads.openwrt.org/releases/24.10.1/targets/x86/64/openwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst'
+
+env:
+  TZ: Europe/Moscow
+
+jobs:
+  build:
+    name: Build luci-app-passwall2 (all)
+    runs-on: ubuntu-latest
+    # The Go toolchain bootstraps from source for the geoview dependency, which
+    # dominates the run; 60 minutes is not reliably enough.
+    timeout-minutes: 150
+    permissions:
+      contents: write
+
+    steps:
+      - name: Refuse to overwrite an existing tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # action-gh-release reuses an existing release and swaps its assets,
+          # but does not move the tag. That would leave the tag pointing at one
+          # revision while serving packages built from another.
+          if gh api "repos/${{ github.repository }}/git/ref/tags/${{ github.event.inputs.tag }}" >/dev/null 2>&1; then
+            echo "tag ${{ github.event.inputs.tag }} already exists; choose a new one"
+            exit 1
+          fi
+
+      - name: Check out the ref to build
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.source_ref }}
+          path: src
+
+      - name: Resolve the exact commit
+        id: src
+        run: |
+          set -euo pipefail
+          sha=$(git -C src rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Building $sha ($(git -C src log -1 --format=%s))"
+
+      - name: Install build dependencies
+        run: |
+          sudo -E rm -rf /usr/share/dotnet /usr/local/lib/android
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget zstd
+          sudo -E apt-get -qq clean
+
+      - name: Fetch SDK and configure feeds
+        run: |
+          set -euo pipefail
+          wget -q --tries=3 --timeout=60 "${{ github.event.inputs.sdk_url }}" -O sdk.tar.zst
+          mkdir sdk
+          tar --zstd -xf sdk.tar.zst -C ./sdk --strip-components=1
+          cd sdk
+
+          # The SDK's default feeds point at git.openwrt.org, which is slow and
+          # occasionally unavailable from Actions runners.
+          sed -i \
+            -e 's|git\.openwrt\.org/feed|github.com/openwrt|g' \
+            -e 's|git\.openwrt\.org/project|github.com/openwrt|g' \
+            -e 's|git\.openwrt\.org/openwrt|github.com/openwrt|g' \
+            feeds.conf.default
+
+          # src-link points at the checkout resolved above, so the build cannot
+          # drift to a newer branch tip while the run is queued.
+          cat > feeds.tmp <<EOF
+          src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main
+          src-link passwall2 ${{ github.workspace }}/src
+          EOF
+          cat feeds.conf.default >> feeds.tmp
+          mv feeds.tmp feeds.conf.default
+
+          # Only the feeds this package actually needs. "-a" additionally clones
+          # routing, telephony and friends, which cost minutes and can fail for
+          # reasons that have nothing to do with this build.
+          ./scripts/feeds update packages luci passwall_packages passwall2
+
+          # geoview is a hard DEPENDS of luci-app-passwall2, so it is inside the
+          # compile closure even though the proxy cores (kconfig selects) are
+          # not. Its go.mod asks for a newer Go than the 24.10 golang feed ships,
+          # and golang-package.mk sets GOTOOLCHAIN=local, so the toolchain cannot
+          # be fetched at build time — the build fails on the dependency, not on
+          # anything of ours. Upstream replaces the whole feed for this reason;
+          # only the golang half is needed here, since nothing in the closure is
+          # written in Rust.
+          git clone --depth 1 -b master https://github.com/openwrt/packages.git /tmp/pkgfeed
+          rm -rf feeds/packages/lang/golang
+          cp -r /tmp/pkgfeed/lang/golang feeds/packages/lang/
+          rm -rf /tmp/pkgfeed
+          ./scripts/feeds update -i
+
+          ./scripts/feeds install -a -p passwall_packages
+          ./scripts/feeds install -a -p passwall2
+          ./scripts/feeds install luci-base
+
+      - name: Mark this build as a fork build
+        run: |
+          set -euo pipefail
+          mk="${{ github.workspace }}/src/luci-app-passwall2/Makefile"
+          suffix='${{ github.event.inputs.pkg_release_suffix }}'
+
+          # Applied to the CI checkout, not committed, so the branch PR #1204 is
+          # cut from keeps the upstream version string.
+          sed -i "s|^PKG_RELEASE:=\(.*\)$|PKG_RELEASE:=\1${suffix}|" "$mk"
+
+          # The i18n packages take their version from PKG_PO_VERSION, not from
+          # PKG_RELEASE. Left alone they would carry a version byte-identical to
+          # the installed upstream one, opkg would answer "up to date", and the
+          # new translations would silently never reach the router — while the
+          # install instructions claimed otherwise.
+          sed -i "s|^PKG_PO_VERSION:=\(.*\)$|PKG_PO_VERSION:=\1${suffix}|" "$mk"
+
+          # A silent no-op in either sed produces a package opkg cannot tell
+          # apart from upstream's — the exact failure the suffix exists to
+          # prevent. Fail loudly instead.
+          for var in PKG_RELEASE PKG_PO_VERSION; do
+            grep -q "^${var}:=.*${suffix}\$" "$mk" || {
+              echo "${var} was not suffixed; refusing to build an indistinguishable package"
+              grep -E '^PKG_VERSION|^PKG_RELEASE|^PKG_PO_VERSION' "$mk"
+              exit 1
+            }
+          done
+
+          # The release tag is a human input and drifts after a rebase onto a
+          # newer upstream version. Refuse to mislabel the artifact.
+          pkg_version=$(sed -n 's|^PKG_VERSION:=||p' "$mk")
+          case '${{ github.event.inputs.tag }}' in
+            *"${pkg_version}"*) ;;
+            *)
+              echo "tag '${{ github.event.inputs.tag }}' does not contain PKG_VERSION '${pkg_version}'"
+              exit 1
+              ;;
+          esac
+
+          grep -E '^PKG_VERSION|^PKG_RELEASE' "$mk"
+
+      - name: Compile
+        run: |
+          set -euo pipefail
+          cd sdk
+
+          # CONFIG_USE_APK=n forces ipk. On 24.10 the symbol is BROKEN-gated and
+          # defconfig drops it, which is harmless; stating it explicitly beats
+          # the upstream workflow's line-arithmetic sed on Config-build.in.
+          cat > .config <<'EOF'
+          CONFIG_ALL_NONSHARED=n
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_AUTOREMOVE=n
+          CONFIG_USE_APK=n
+          CONFIG_LUCI_LANG_ru=y
+          CONFIG_LUCI_LANG_fa=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_LUCI_LANG_zh_Hant=y
+          CONFIG_PACKAGE_luci-app-passwall2=m
+          EOF
+          make defconfig
+
+          make package/luci-app-passwall2/{clean,compile} -j$(nproc) V=s \
+            || make package/luci-app-passwall2/{clean,compile} -j1 V=s
+
+          mkdir -p "$GITHUB_WORKSPACE/upload"
+          find bin/packages -name 'luci-app-passwall2*' -o -name 'luci-i18n-passwall2*' \
+            | xargs -r -I{} cp {} "$GITHUB_WORKSPACE/upload/"
+          ls -l "$GITHUB_WORKSPACE/upload"
+
+      - name: Verify the artifact is the one we meant to build
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/upload"
+          app=$(ls luci-app-passwall2_*.ipk 2>/dev/null | head -1)
+          [ -n "$app" ] || { echo "no application package produced"; exit 1; }
+          ls luci-i18n-passwall2-ru_*.ipk >/dev/null || { echo "no ru i18n package produced"; exit 1; }
+
+          # A build that silently lost the feed override would produce a
+          # perfectly valid upstream package. Prove the TrustTunnel files are in.
+          mkdir -p /tmp/check && tar -xf "$app" -C /tmp/check
+          tar -tzf /tmp/check/data.tar.gz > /tmp/check/files.txt
+          for f in util_trusttunnel.lua client/type/trusttunnel.lua; do
+            grep -q "$f" /tmp/check/files.txt || {
+              echo "built package does not contain $f — wrong ref or feed?"
+              exit 1
+            }
+          done
+          echo "contents verified"
+          sha256sum *.ipk | tee SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          target_commitish: ${{ steps.src.outputs.sha }}
+          prerelease: true
+          name: "luci-app-passwall2 with TrustTunnel — ${{ github.event.inputs.tag }}"
+          body: |
+            Fork build of `luci-app-passwall2` including the TrustTunnel node type
+            (upstream PR #1204).
+
+            Built from `${{ github.event.inputs.source_ref }}` at
+            `${{ steps.src.outputs.sha }}`.
+
+            Install the application together with the translation packages you use —
+            the UI strings live in the i18n packages, and a stale `.lmo` shows the
+            old strings:
+
+            ```
+            opkg install ./luci-app-passwall2_*.ipk ./luci-i18n-passwall2-ru_*.ipk
+            ```
+
+            **Then pin it:**
+
+            ```
+            opkg flag hold luci-app-passwall2
+            ```
+
+            Without the hold, upstream's next release — they ship every two to four
+            weeks — wins the version comparison, `opkg upgrade` replaces this build,
+            and the TrustTunnel node type disappears while the nodes stay in
+            `/etc/config/passwall2` and quietly stop carrying traffic. With the hold
+            the same forgetfulness merely leaves the package pinned.
+
+            Not an upstream release. The binary cores (xray, sing-box, ...) are
+            unmodified and still come from the upstream package feed.
+          files: |
+            upload/*.ipk
+            upload/SHA256SUMS
